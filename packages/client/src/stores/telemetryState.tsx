@@ -18,7 +18,7 @@ type TelemetryState = {
 };
 
 export const telemetryState = createPersistedMutable(
-	'sd-explorer-layout',
+	'sd-telemetry-data',
 	createMutable<TelemetryState>({
 		shareFullTelemetry: false, // false by default
 		platform: 'unknown',
