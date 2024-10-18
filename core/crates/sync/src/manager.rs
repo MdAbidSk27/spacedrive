@@ -1,14 +1,18 @@
 use sd_core_prisma_helpers::DevicePubId;
 
-use sd_prisma::prisma::{cloud_crdt_operation, crdt_operation, device, PrismaClient, SortOrder};
+use sd_prisma::{
+	prisma::{crdt_operation, device, PrismaClient, SortOrder},
+	prisma_sync,
+};
 use sd_sync::{
 	CRDTOperation, CompressedCRDTOperationsPerModel, CompressedCRDTOperationsPerModelPerDevice,
-	OperationFactory,
+	ModelId, OperationFactory,
 };
-use sd_utils::from_bytes_to_uuid;
+use sd_utils::timestamp_to_datetime;
 
 use std::{
-	cmp, fmt,
+	collections::BTreeMap,
+	fmt,
 	num::NonZeroU128,
 	sync::{
 		atomic::{self, AtomicBool},
@@ -19,17 +23,14 @@ use std::{
 use async_stream::stream;
 use futures::Stream;
 use futures_concurrency::future::TryJoin;
-use prisma_client_rust::{and, operator::or};
 use tokio::sync::{broadcast, Mutex, Notify, RwLock};
-use tracing::warn;
+use tracing::{debug, warn};
 use uhlc::{HLCBuilder, HLC};
 use uuid::Uuid;
 
 use super::{
-	crdt_op_db,
-	db_operation::{from_cloud_crdt_ops, from_crdt_ops},
-	ingest_utils::process_crdt_operations,
-	Error, SyncEvent, TimestampPerDevice, NTP64,
+	crdt_op_db, db_operation::from_crdt_ops, ingest_utils::process_crdt_operations, Error,
+	SyncEvent, TimestampPerDevice, NTP64,
 };
 
 /// Wrapper that spawns the ingest actor and provides utilities for reading and writing sync operations.
@@ -139,33 +140,52 @@ impl Manager {
 		&self,
 		CompressedCRDTOperationsPerModelPerDevice(compressed_ops): CompressedCRDTOperationsPerModelPerDevice,
 	) -> Result<(), Error> {
+		// WARN: this order here exists because sync messages MUST be processed in this exact order
+		// due to relationship dependencies between these tables.
+		const INGEST_ORDER: &[ModelId] = &[
+			prisma_sync::device::MODEL_ID,
+			prisma_sync::storage_statistics::MODEL_ID,
+			prisma_sync::tag::MODEL_ID,
+			prisma_sync::location::MODEL_ID,
+			prisma_sync::object::MODEL_ID,
+			prisma_sync::exif_data::MODEL_ID,
+			prisma_sync::file_path::MODEL_ID,
+			prisma_sync::label::MODEL_ID,
+			prisma_sync::tag_on_object::MODEL_ID,
+			prisma_sync::label_on_object::MODEL_ID,
+		];
+
 		let _lock_guard = self.sync_lock.lock().await;
 
-		// Each `ops` vec is for an independent record, so we can process them concurrently
-		compressed_ops
-			.into_iter()
-			.flat_map(
-				|(device_pub_id, CompressedCRDTOperationsPerModel(ops_per_model))| {
-					ops_per_model
-						.into_iter()
-						.flat_map(move |(model_id, ops_per_record)| {
-							ops_per_record.into_iter().map(move |(record_id, ops)| {
-								process_crdt_operations(
-									&self.clock,
-									&self.timestamp_per_device,
-									&self.db,
-									device_pub_id.into(),
-									model_id,
-									record_id,
-									ops,
-								)
-							})
-						})
-				},
-			)
-			.collect::<Vec<_>>()
-			.try_join()
-			.await?;
+		let mut ops_fut_by_model = INGEST_ORDER
+			.iter()
+			.map(|&model_id| (model_id, vec![]))
+			.collect::<BTreeMap<_, _>>();
+
+		for (device_pub_id, CompressedCRDTOperationsPerModel(ops_per_model)) in compressed_ops {
+			for (model_id, ops_per_record) in ops_per_model {
+				for (record_id, ops) in ops_per_record {
+					ops_fut_by_model
+						.get_mut(&model_id)
+						.ok_or(Error::InvalidModelId(model_id))?
+						.push(process_crdt_operations(
+							&self.clock,
+							&self.timestamp_per_device,
+							&self.db,
+							device_pub_id.into(),
+							model_id,
+							record_id,
+							ops,
+						));
+				}
+			}
+		}
+
+		for model_id in INGEST_ORDER {
+			if let Some(futs) = ops_fut_by_model.remove(model_id) {
+				futs.try_join().await?;
+			}
+		}
 
 		if self.tx.send(SyncEvent::Ingested).is_err() {
 			warn!("failed to send ingested message on `ingest_ops`");
@@ -257,27 +277,27 @@ impl Manager {
 		Ok(ret)
 	}
 
-	pub async fn get_device_ops(
-		&self,
-		count: u32,
-		device_pub_id: DevicePubId,
-		timestamp: NTP64,
-	) -> Result<Vec<CRDTOperation>, Error> {
-		self.db
-			.crdt_operation()
-			.find_many(vec![
-				crdt_operation::device_pub_id::equals(device_pub_id.into()),
-				#[allow(clippy::cast_possible_wrap)]
-				crdt_operation::timestamp::gt(timestamp.as_u64() as i64),
-			])
-			.take(i64::from(count))
-			.order_by(crdt_operation::timestamp::order(SortOrder::Asc))
-			.exec()
-			.await?
-			.into_iter()
-			.map(from_crdt_ops)
-			.collect()
-	}
+	// pub async fn get_device_ops(
+	// 	&self,
+	// 	count: u32,
+	// 	device_pub_id: DevicePubId,
+	// 	timestamp: NTP64,
+	// ) -> Result<Vec<CRDTOperation>, Error> {
+	// 	self.db
+	// 		.crdt_operation()
+	// 		.find_many(vec![
+	// 			crdt_operation::device_pub_id::equals(device_pub_id.into()),
+	// 			#[allow(clippy::cast_possible_wrap)]
+	// 			crdt_operation::timestamp::gt(timestamp.as_u64() as i64),
+	// 		])
+	// 		.take(i64::from(count))
+	// 		.order_by(crdt_operation::timestamp::order(SortOrder::Asc))
+	// 		.exec()
+	// 		.await?
+	// 		.into_iter()
+	// 		.map(from_crdt_ops)
+	// 		.collect()
+	// }
 
 	pub fn stream_device_ops<'a>(
 		&'a self,
@@ -300,132 +320,134 @@ impl Manager {
 					.exec()
 					.await
 				{
-					Ok(ops) => {
-						if ops.is_empty() {
-							break;
+					Ok(ops) if ops.is_empty() => break,
+
+					Ok(ops) => match ops
+						.into_iter()
+						.map(from_crdt_ops)
+						.collect::<Result<Vec<_>, _>>()
+					{
+						Ok(ops) => {
+							debug!(
+								start_datetime = ?ops
+									.first()
+									.map(|op| timestamp_to_datetime(op.timestamp)),
+								end_datetime = ?ops
+									.last()
+									.map(|op| timestamp_to_datetime(op.timestamp)),
+								count = ops.len(),
+								"Streaming crdt ops",
+							);
+
+							if let Some(last_op) = ops.last() {
+								current_initial_timestamp = last_op.timestamp;
+							}
+
+							yield Ok(ops);
 						}
 
-						match ops.into_iter().map(from_crdt_ops).collect::<Result<Vec<_>, _>>() {
-							Ok(ops) => {
-								if let Some(last_op) = ops.last() {
-									current_initial_timestamp = last_op.timestamp;
-								}
-
-								yield Ok(ops);
-							},
-							Err(e) => {
-								yield Err(e);
-								break;
-							},
-						}
+						Err(e) => return yield Err(e),
 					}
 
-					Err(e) => {
-						yield Err(e.into());
-						break;
-					}
+					Err(e) => return yield Err(e.into())
 				}
 			}
 		}
 	}
 
-	pub async fn get_ops(
-		&self,
-		count: u32,
-		timestamp_per_device: Vec<(DevicePubId, NTP64)>,
-	) -> Result<Vec<CRDTOperation>, Error> {
-		let mut ops = self
-			.db
-			.crdt_operation()
-			.find_many(vec![or(timestamp_per_device
-				.iter()
-				.map(|(device_pub_id, timestamp)| {
-					and![
-						crdt_operation::device::is(vec![device::pub_id::equals(
-							device_pub_id.to_db()
-						)]),
-						crdt_operation::timestamp::gt({
-							#[allow(clippy::cast_possible_wrap)]
-							// SAFETY: we had to store using i64 due to SQLite limitations
-							{
-								timestamp.as_u64() as i64
-							}
-						})
-					]
-				})
-				.chain([crdt_operation::device::is_not(vec![
-					device::pub_id::in_vec(
-						timestamp_per_device
-							.iter()
-							.map(|(device_pub_id, _)| device_pub_id.to_db())
-							.collect(),
-					),
-				])])
-				.collect())])
-			.take(i64::from(count))
-			.order_by(crdt_operation::timestamp::order(SortOrder::Asc))
-			.exec()
-			.await?;
+	// pub async fn get_ops(
+	// 	&self,
+	// 	count: u32,
+	// 	timestamp_per_device: Vec<(DevicePubId, NTP64)>,
+	// ) -> Result<Vec<CRDTOperation>, Error> {
+	// 	let mut ops = self
+	// 		.db
+	// 		.crdt_operation()
+	// 		.find_many(vec![or(timestamp_per_device
+	// 			.iter()
+	// 			.map(|(device_pub_id, timestamp)| {
+	// 				and![
+	// 					crdt_operation::device_pub_id::equals(device_pub_id.to_db()),
+	// 					crdt_operation::timestamp::gt({
+	// 						#[allow(clippy::cast_possible_wrap)]
+	// 						// SAFETY: we had to store using i64 due to SQLite limitations
+	// 						{
+	// 							timestamp.as_u64() as i64
+	// 						}
+	// 					})
+	// 				]
+	// 			})
+	// 			.chain([crdt_operation::device_pub_id::not_in_vec(
+	// 				timestamp_per_device
+	// 					.iter()
+	// 					.map(|(device_pub_id, _)| device_pub_id.to_db())
+	// 					.collect(),
+	// 			)])
+	// 			.collect())])
+	// 		.take(i64::from(count))
+	// 		.order_by(crdt_operation::timestamp::order(SortOrder::Asc))
+	// 		.exec()
+	// 		.await?;
 
-		ops.sort_by(|a, b| match a.timestamp.cmp(&b.timestamp) {
-			cmp::Ordering::Equal => {
-				from_bytes_to_uuid(&a.device_pub_id).cmp(&from_bytes_to_uuid(&b.device_pub_id))
-			}
-			o => o,
-		});
+	// 	ops.sort_by(|a, b| match a.timestamp.cmp(&b.timestamp) {
+	// 		cmp::Ordering::Equal => {
+	// 			from_bytes_to_uuid(&a.device_pub_id).cmp(&from_bytes_to_uuid(&b.device_pub_id))
+	// 		}
+	// 		o => o,
+	// 	});
 
-		ops.into_iter()
-			.take(count as usize)
-			.map(from_crdt_ops)
-			.collect()
-	}
+	// 	ops.into_iter()
+	// 		.take(count as usize)
+	// 		.map(from_crdt_ops)
+	// 		.collect()
+	// }
 
-	pub async fn get_cloud_ops(
-		&self,
-		count: u32,
-		timestamp_per_device: Vec<(DevicePubId, NTP64)>,
-	) -> Result<Vec<(cloud_crdt_operation::id::Type, CRDTOperation)>, Error> {
-		let mut ops = self
-			.db
-			.cloud_crdt_operation()
-			.find_many(vec![or(timestamp_per_device
-				.iter()
-				.map(|(device_pub_id, timestamp)| {
-					and![
-						cloud_crdt_operation::device_pub_id::equals(device_pub_id.to_db()),
-						cloud_crdt_operation::timestamp::gt({
-							#[allow(clippy::cast_possible_wrap)]
-							// SAFETY: we had to store using i64 due to SQLite limitations
-							{
-								timestamp.as_u64() as i64
-							}
-						})
-					]
-				})
-				.chain([cloud_crdt_operation::device_pub_id::not_in_vec(
-					timestamp_per_device
-						.iter()
-						.map(|(device_pub_id, _)| device_pub_id.to_db())
-						.collect(),
-				)])
-				.collect())])
-			.take(i64::from(count))
-			.order_by(cloud_crdt_operation::timestamp::order(SortOrder::Asc))
-			.exec()
-			.await?;
+	// pub async fn get_cloud_ops(
+	// 	&self,
+	// 	count: u32,
+	// 	timestamp_per_device: Vec<(DevicePubId, NTP64)>,
+	// ) -> Result<Vec<(cloud_crdt_operation::id::Type, CRDTOperation)>, Error> {
+	// 	let mut ops = self
+	// 		.db
+	// 		.cloud_crdt_operation()
+	// 		.find_many(vec![or(timestamp_per_device
+	// 			.iter()
+	// 			.map(|(device_pub_id, timestamp)| {
+	// 				and![
+	// 					cloud_crdt_operation::device_pub_id::equals(device_pub_id.to_db()),
+	// 					cloud_crdt_operation::timestamp::gt({
+	// 						#[allow(clippy::cast_possible_wrap)]
+	// 						// SAFETY: we had to store using i64 due to SQLite limitations
+	// 						{
+	// 							timestamp.as_u64() as i64
+	// 						}
+	// 					})
+	// 				]
+	// 			})
+	// 			.chain([cloud_crdt_operation::device_pub_id::not_in_vec(
+	// 				timestamp_per_device
+	// 					.iter()
+	// 					.map(|(device_pub_id, _)| device_pub_id.to_db())
+	// 					.collect(),
+	// 			)])
+	// 			.collect())])
+	// 		.take(i64::from(count))
+	// 		.order_by(cloud_crdt_operation::timestamp::order(SortOrder::Asc))
+	// 		.exec()
+	// 		.await?;
 
-		ops.sort_by(|a, b| match a.timestamp.cmp(&b.timestamp) {
-			cmp::Ordering::Equal => {
-				from_bytes_to_uuid(&a.device_pub_id).cmp(&from_bytes_to_uuid(&b.device_pub_id))
-			}
-			o => o,
-		});
+	// 	ops.sort_by(|a, b| match a.timestamp.cmp(&b.timestamp) {
+	// 		cmp::Ordering::Equal => {
+	// 			from_bytes_to_uuid(&a.device_pub_id).cmp(&from_bytes_to_uuid(&b.device_pub_id))
+	// 		}
+	// 		o => o,
+	// 	});
 
-		ops.into_iter()
-			.take(count as usize)
-			.map(from_cloud_crdt_ops)
-			.collect()
-	}
+	// 	ops.into_iter()
+	// 		.take(count as usize)
+	// 		.map(from_cloud_crdt_ops)
+	// 		.collect()
+	// }
 }
 
 impl OperationFactory for Manager {

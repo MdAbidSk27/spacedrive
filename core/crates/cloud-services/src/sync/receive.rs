@@ -22,7 +22,6 @@ use sd_prisma::prisma::PrismaClient;
 use std::{
 	collections::{hash_map::Entry, HashMap},
 	future::IntoFuture,
-	num::NonZero,
 	path::Path,
 	pin::Pin,
 	sync::{
@@ -34,7 +33,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use futures::{FutureExt, StreamExt, TryStreamExt};
-use futures_concurrency::future::{Join, Race, TryJoin};
+use futures_concurrency::future::{Race, TryJoin};
 use quic_rpc::transport::quinn::QuinnConnection;
 use reqwest::Response;
 use reqwest_middleware::ClientWithMiddleware;
@@ -42,15 +41,14 @@ use serde::{Deserialize, Serialize};
 use tokio::{
 	fs,
 	io::{self, AsyncRead, AsyncReadExt, ReadBuf},
-	spawn,
-	sync::{Notify, Semaphore},
+	sync::Notify,
 	time::sleep,
 };
 use tokio_util::io::StreamReader;
-use tracing::{error, instrument};
+use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
-use super::{SyncActors, ONE_MINUTE};
+use super::{ReceiveAndIngestNotifiers, SyncActors, ONE_MINUTE};
 
 const CLOUD_SYNC_DATA_KEEPER_FILE: &str = "cloud_sync_data_keeper.bin";
 
@@ -62,12 +60,11 @@ pub struct Receiver {
 	device_pub_id: devices::PubId,
 	cloud_services: Arc<CloudServices>,
 	cloud_client: Client<QuinnConnection<Service>>,
-	semaphore: Arc<Semaphore>,
 	key_manager: Arc<KeyManager>,
 	sync: SyncManager,
-	ingest_notify: Arc<Notify>,
+	notifiers: Arc<ReceiveAndIngestNotifiers>,
 	active: Arc<AtomicBool>,
-	active_notify: Arc<Notify>,
+	active_notifier: Arc<Notify>,
 }
 
 impl Actor<SyncActors> for Receiver {
@@ -81,23 +78,26 @@ impl Actor<SyncActors> for Receiver {
 
 		loop {
 			self.active.store(true, Ordering::Relaxed);
-			self.active_notify.notify_waiters();
+			self.active_notifier.notify_waiters();
 
 			let res = self.run_loop_iteration().await;
 
 			self.active.store(false, Ordering::Relaxed);
 
 			if let Err(e) = res {
-				error!(?e, "Error during cloud sync sender actor iteration");
+				error!(?e, "Error during cloud sync receiver actor iteration");
 				sleep(ONE_MINUTE).await;
 				continue;
 			}
 
-			self.active_notify.notify_waiters();
+			self.active_notifier.notify_waiters();
 
 			if matches!(
 				(
 					sleep(ONE_MINUTE).map(|()| Race::Continue),
+					self.notifiers
+						.wait_notification_to_receive()
+						.map(|()| Race::Continue),
 					stop.into_future().map(|()| Race::Stop),
 				)
 					.race()
@@ -116,7 +116,7 @@ impl Receiver {
 		sync_group_pub_id: groups::PubId,
 		cloud_services: Arc<CloudServices>,
 		sync: SyncManager,
-		ingest_notify: Arc<Notify>,
+		notifiers: Arc<ReceiveAndIngestNotifiers>,
 		active: Arc<AtomicBool>,
 		active_notify: Arc<Notify>,
 	) -> Result<Self, Error> {
@@ -134,16 +134,11 @@ impl Receiver {
 			device_pub_id: devices::PubId(Uuid::from(&sync.device_pub_id)),
 			cloud_services,
 			cloud_client,
-			semaphore: Arc::new(Semaphore::new(
-				std::thread::available_parallelism()
-					.map(NonZero::get)
-					.unwrap_or(1),
-			)),
 			key_manager,
 			sync,
-			ingest_notify,
+			notifiers,
 			active,
-			active_notify,
+			active_notifier: active_notify,
 		})
 	}
 
@@ -176,8 +171,9 @@ impl Receiver {
 			}
 
 			self.handle_new_messages(new_messages).await?;
-			self.ingest_notify.notify_waiters();
 		}
+
+		debug!("Finished sync messages receiver actor iteration");
 
 		self.keeper.save().await
 	}
@@ -186,35 +182,36 @@ impl Receiver {
 		&mut self,
 		new_messages: Vec<MessagesCollection>,
 	) -> Result<(), Error> {
-		let handles = new_messages
-			.into_iter()
-			.map(|message| {
-				let sync_group_pub_id = self.sync_group_pub_id;
-				let semaphore = Arc::clone(&self.semaphore);
-				let key_manager = Arc::clone(&self.key_manager);
-				let sync = self.sync.clone();
-				let http_client = self.cloud_services.http_client().clone();
+		debug!(
+			new_messages_collections_count = new_messages.len(),
+			start_time = ?new_messages.first().map(|c| c.start_time),
+			end_time = ?new_messages.first().map(|c| c.end_time),
+			"Handling new sync messages collections",
+		);
 
-				async move {
-					spawn(handle_single_message(
-						sync_group_pub_id,
-						message,
-						semaphore,
-						key_manager,
-						sync,
-						http_client,
-					))
-					.await
-				}
-			})
-			.collect::<Vec<_>>();
+		for message in new_messages.into_iter().filter(|message| {
+			if message.original_device_pub_id == self.device_pub_id {
+				warn!("Received sync message from the current device, need to check backend, this is a bug!");
+				false
+			} else {
+				true
+			}
+		}) {
+			debug!(
+				new_messages_count = message.operations_count,
+				start_time = ?message.start_time,
+				end_time = ?message.end_time,
+				"Handling new sync messages",
+			);
 
-		for res in handles.join().await {
-			let Ok(res) = res else {
-				return Err(Error::SyncMessagesDownloadAndDecryptTaskPanicked);
-			};
-
-			let (device_pub_id, timestamp) = res?;
+			let (device_pub_id, timestamp) = handle_single_message(
+				self.sync_group_pub_id,
+				message,
+				&self.key_manager,
+				&self.sync,
+				self.cloud_services.http_client(),
+			)
+			.await?;
 
 			match self.keeper.timestamps.entry(device_pub_id) {
 				Entry::Occupied(mut entry) => {
@@ -222,16 +219,26 @@ impl Receiver {
 						*entry.get_mut() = timestamp;
 					}
 				}
+
 				Entry::Vacant(entry) => {
 					entry.insert(timestamp);
 				}
 			}
+
+			// To ingest after each sync message collection is received, we MUST download and
+			// store the messages SEQUENTIALLY, otherwise we might ingest messages out of order
+			// due to parallel downloads
+			self.notifiers.notify_ingester();
 		}
 
 		Ok(())
 	}
 }
 
+#[instrument(
+	skip_all,
+	fields(%sync_group_pub_id, %original_device_pub_id, operations_count, ?key_hash, %end_time),
+)]
 async fn handle_single_message(
 	sync_group_pub_id: groups::PubId,
 	MessagesCollection {
@@ -242,20 +249,14 @@ async fn handle_single_message(
 		signed_download_link,
 		..
 	}: MessagesCollection,
-	semaphore: Arc<Semaphore>,
-	key_manager: Arc<KeyManager>,
-	sync: SyncManager,
-	http_client: ClientWithMiddleware,
+	key_manager: &KeyManager,
+	sync: &SyncManager,
+	http_client: &ClientWithMiddleware,
 ) -> Result<(devices::PubId, DateTime<Utc>), Error> {
 	// FIXME(@fogodev): If we don't have the key hash, we need to fetch it from another device in the group if possible
 	let Some(secret_key) = key_manager.get_key(sync_group_pub_id, &key_hash).await else {
 		return Err(Error::MissingKeyHash);
 	};
-
-	let _permit = semaphore
-		.acquire()
-		.await
-		.expect("sync messages receiver semaphore never closes");
 
 	let response = http_client
 		.get(signed_download_link)
@@ -266,20 +267,25 @@ async fn handle_single_message(
 		.map_err(Error::ErrorResponseDownloadSyncMessages)?;
 
 	let crdt_ops = if let Some(size) = response.content_length() {
+		debug!(size, "Received encrypted sync messages collection");
 		extract_messages_known_size(response, size, secret_key, original_device_pub_id).await
 	} else {
+		debug!("Received encrypted sync messages collection of unknown size");
 		extract_messages_unknown_size(response, secret_key, original_device_pub_id).await
 	}?;
+
 	assert_eq!(
 		crdt_ops.len(),
 		operations_count as usize,
 		"Sync messages count mismatch"
 	);
+
 	write_cloud_ops_to_db(crdt_ops, &sync.db).await?;
+
 	Ok((original_device_pub_id, end_time))
 }
 
-#[instrument(skip(response, secret_key), err)]
+#[instrument(skip(response, size, secret_key), err)]
 async fn extract_messages_known_size(
 	response: Response,
 	size: u64,
@@ -321,7 +327,7 @@ async fn extract_messages_known_size(
 		plain_text
 	};
 
-	postcard::from_bytes::<CompressedCRDTOperationsPerModel>(&plain_text)
+	rmp_serde::from_slice::<CompressedCRDTOperationsPerModel>(&plain_text)
 		.map(|compressed_ops| compressed_ops.into_ops(device_pub_id))
 		.map_err(Error::DeserializationFailureToPullSyncMessages)
 }
@@ -349,7 +355,7 @@ async fn extract_messages_unknown_size(
 		}
 	};
 
-	postcard::from_bytes::<CompressedCRDTOperationsPerModel>(&plain_text)
+	rmp_serde::from_slice::<CompressedCRDTOperationsPerModel>(&plain_text)
 		.map(|compressed_ops| compressed_ops.into_ops(device_pub_id))
 		.map_err(Error::DeserializationFailureToPullSyncMessages)
 }
@@ -381,8 +387,8 @@ impl LastTimestampKeeper {
 
 		match fs::read(&file_path).await {
 			Ok(bytes) => Ok(Self {
-				timestamps: postcard::from_bytes(&bytes)
-					.map_err(Error::LastTimestampKeeperSerialization)?,
+				timestamps: rmp_serde::from_slice(&bytes)
+					.map_err(Error::LastTimestampKeeperDeserialization)?,
 				file_path,
 			}),
 
@@ -398,7 +404,7 @@ impl LastTimestampKeeper {
 	async fn save(&self) -> Result<(), Error> {
 		fs::write(
 			&self.file_path,
-			&postcard::to_stdvec(&self.timestamps)
+			&rmp_serde::to_vec_named(&self.timestamps)
 				.map_err(Error::LastTimestampKeeperSerialization)?,
 		)
 		.await

@@ -4,7 +4,7 @@ use sd_core_file_path_helper::{FilePathError, IsolatedFilePathData};
 use sd_core_prisma_helpers::{
 	file_path_pub_and_cas_ids, file_path_to_isolate_with_pub_id, file_path_walker,
 };
-use sd_core_sync::SyncManager;
+use sd_core_sync::{DevicePubId, SyncManager};
 
 use sd_prisma::{
 	prisma::{file_path, indexer_rule, location, PrismaClient, SortOrder},
@@ -50,6 +50,8 @@ pub enum Error {
 	IndexerRuleNotFound(indexer_rule::id::Type),
 	#[error(transparent)]
 	SubPath(#[from] sub_path::Error),
+	#[error("device not found: <device_pub_id='{0}'")]
+	DeviceNotFound(DevicePubId),
 
 	// Internal Errors
 	#[error("database error: {0}")]
@@ -230,6 +232,10 @@ async fn remove_non_existing_file_paths(
 		})
 		.unzip();
 
+	if sync_params.is_empty() {
+		return Ok(0);
+	}
+
 	sync.write_ops(
 		db,
 		(
@@ -320,7 +326,7 @@ pub async fn reverse_update_directories_sizes(
 	)
 	.await?;
 
-	let to_sync_and_update = ancestors
+	let (sync_ops, update_queries) = ancestors
 		.into_values()
 		.filter_map(|materialized_path| {
 			if let Some((pub_id, size)) =
@@ -348,7 +354,9 @@ pub async fn reverse_update_directories_sizes(
 		})
 		.unzip::<_, _, Vec<_>, Vec<_>>();
 
-	sync.write_ops(db, to_sync_and_update).await?;
+	if !sync_ops.is_empty() && !update_queries.is_empty() {
+		sync.write_ops(db, (sync_ops, update_queries)).await?;
+	}
 
 	Ok(())
 }

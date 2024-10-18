@@ -10,6 +10,7 @@ use sd_crypto::{
 	CryptoRng,
 };
 use sd_utils::error::FileIOError;
+use tracing::debug;
 
 use std::{
 	collections::{BTreeMap, VecDeque},
@@ -55,6 +56,12 @@ impl KeyStore {
 		key: SecretKey,
 		key_hash: KeyHash,
 	) {
+		debug!(
+			key_hash = key_hash.0,
+			?group_pub_id,
+			"Added single cloud sync key to key manager"
+		);
+
 		self.keys
 			.entry(group_pub_id)
 			.or_default()
@@ -71,10 +78,15 @@ impl KeyStore {
 		// We reverse the secret keys as a implementation detail to
 		// keep the keys in the same order as they were added as a stack
 		for key in keys.into_iter().rev() {
-			group_entry.push_front((
-				KeyHash(blake3::hash(key.as_ref()).to_hex().to_string()),
-				key,
-			));
+			let key_hash = blake3::hash(key.as_ref()).to_hex().to_string();
+
+			debug!(
+				key_hash,
+				?group_pub_id,
+				"Added cloud sync key to key manager"
+			);
+
+			group_entry.push_front((KeyHash(key_hash), key));
 		}
 	}
 
@@ -117,7 +129,8 @@ impl KeyStore {
 		rng: &mut CryptoRng,
 		keys_file_path: &PathBuf,
 	) -> Result<(), Error> {
-		let plain_text_bytes = postcard::to_stdvec(self).map_err(Error::KeyStoreSerialization)?;
+		let plain_text_bytes =
+			rmp_serde::to_vec_named(self).map_err(Error::KeyStoreSerialization)?;
 		let mut file = BufWriter::with_capacity(
 			EncryptedBlock::CIPHER_TEXT_SIZE,
 			fs::OpenOptions::new()
@@ -211,64 +224,87 @@ impl KeyStore {
 		let usize_file_len =
 			usize::try_from(metadata.len()).expect("Failed to convert metadata length to usize");
 
-		postcard::from_bytes(&if usize_file_len
-			<= EncryptedBlock::CIPHER_TEXT_SIZE + size_of::<OneShotNonce>()
-		{
-			use decrypt::OneShotDecryption;
+		let key_store_bytes =
+			if usize_file_len <= EncryptedBlock::CIPHER_TEXT_SIZE + size_of::<OneShotNonce>() {
+				use decrypt::OneShotDecryption;
 
-			let mut nonce = OneShotNonce::default();
+				let mut nonce = OneShotNonce::default();
 
-			file.read_exact(&mut nonce).await.map_err(|e| {
-				FileIOError::from((
-					keys_file_path,
-					e,
-					"Failed to read space keys file oneshot nonce",
-				))
-			})?;
-
-			let mut cipher_text = vec![0u8; usize_file_len - size_of::<OneShotNonce>()];
-
-			file.read_exact(&mut cipher_text).await.map_err(|e| {
-				FileIOError::from((
-					keys_file_path,
-					e,
-					"Failed to read space keys file oneshot cipher text",
-				))
-			})?;
-
-			key.decrypt_owned(&EncryptedBlock { nonce, cipher_text })
-				.map_err(|e| Error::KeyStoreCrypto {
-					source: e,
-					context: "Failed to oneshot decrypt space keys file",
-				})?
-		} else {
-			use decrypt::StreamDecryption;
-
-			let mut nonce = StreamNonce::default();
-
-			let mut key_store_bytes = Vec::with_capacity(
-				(usize_file_len - size_of::<StreamNonce>()) / EncryptedBlock::CIPHER_TEXT_SIZE
-					* EncryptedBlock::PLAIN_TEXT_SIZE,
-			);
-
-			file.read_exact(&mut nonce).await.map_err(|e| {
-				FileIOError::from((
-					keys_file_path,
-					e,
-					"Failed to read space keys file stream nonce",
-				))
-			})?;
-
-			key.decrypt(&nonce, &mut file, &mut key_store_bytes)
-				.await
-				.map_err(|e| Error::KeyStoreCrypto {
-					source: e,
-					context: "Failed to stream decrypt space keys file",
+				file.read_exact(&mut nonce).await.map_err(|e| {
+					FileIOError::from((
+						keys_file_path,
+						e,
+						"Failed to read space keys file oneshot nonce",
+					))
 				})?;
 
-			key_store_bytes
-		})
-		.map_err(Error::KeyStoreSerialization)
+				let mut cipher_text = vec![0u8; usize_file_len - size_of::<OneShotNonce>()];
+
+				file.read_exact(&mut cipher_text).await.map_err(|e| {
+					FileIOError::from((
+						keys_file_path,
+						e,
+						"Failed to read space keys file oneshot cipher text",
+					))
+				})?;
+
+				key.decrypt_owned(&EncryptedBlock { nonce, cipher_text })
+					.map_err(|e| Error::KeyStoreCrypto {
+						source: e,
+						context: "Failed to oneshot decrypt space keys file",
+					})?
+			} else {
+				use decrypt::StreamDecryption;
+
+				let mut nonce = StreamNonce::default();
+
+				let mut key_store_bytes = Vec::with_capacity(
+					(usize_file_len - size_of::<StreamNonce>()) / EncryptedBlock::CIPHER_TEXT_SIZE
+						* EncryptedBlock::PLAIN_TEXT_SIZE,
+				);
+
+				file.read_exact(&mut nonce).await.map_err(|e| {
+					FileIOError::from((
+						keys_file_path,
+						e,
+						"Failed to read space keys file stream nonce",
+					))
+				})?;
+
+				key.decrypt(&nonce, &mut file, &mut key_store_bytes)
+					.await
+					.map_err(|e| Error::KeyStoreCrypto {
+						source: e,
+						context: "Failed to stream decrypt space keys file",
+					})?;
+
+				key_store_bytes
+			};
+
+		let this = rmp_serde::from_slice::<Self>(&key_store_bytes)
+			.map_err(Error::KeyStoreDeserialization)?;
+
+		#[cfg(debug_assertions)]
+		{
+			use std::fmt::Write;
+			let mut key_hashes_log = String::new();
+
+			this.keys.iter().for_each(|(group_pub_id, key_stack)| {
+				writeln!(
+					key_hashes_log,
+					"Group: {group_pub_id:?} => KeyHashes: {:?}",
+					key_stack
+						.iter()
+						.map(|(KeyHash(key_hash), _)| key_hash)
+						.collect::<Vec<_>>()
+				)
+				.expect("Failed to write to key hashes log");
+			});
+
+			tracing::info!("Loaded key hashes: {key_hashes_log}");
+		}
+
+		Ok(this)
 	}
 }
 

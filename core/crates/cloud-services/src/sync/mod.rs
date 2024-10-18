@@ -1,7 +1,6 @@
 use crate::{CloudServices, Error};
 
-use futures_concurrency::future::TryJoin;
-use sd_core_sync::{SyncManager, NTP64};
+use sd_core_sync::SyncManager;
 
 use sd_actors::{ActorsCollection, IntoActor};
 use sd_cloud_schema::sync::groups;
@@ -11,10 +10,10 @@ use std::{
 	fmt,
 	path::Path,
 	sync::{atomic::AtomicBool, Arc},
-	time::{Duration, SystemTime, UNIX_EPOCH},
+	time::Duration,
 };
 
-use chrono::{DateTime, Utc};
+use futures_concurrency::future::TryJoin;
 use tokio::sync::Notify;
 
 mod ingest;
@@ -32,7 +31,8 @@ pub struct SyncActorsState {
 	pub send_active: Arc<AtomicBool>,
 	pub receive_active: Arc<AtomicBool>,
 	pub ingest_active: Arc<AtomicBool>,
-	pub notifier: Arc<Notify>,
+	pub state_change_notifier: Arc<Notify>,
+	receiver_and_ingester_notifiers: Arc<ReceiveAndIngestNotifiers>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, specta::Type)]
@@ -53,6 +53,30 @@ impl fmt::Display for SyncActors {
 	}
 }
 
+#[derive(Debug, Default)]
+pub struct ReceiveAndIngestNotifiers {
+	ingester: Notify,
+	receiver: Notify,
+}
+
+impl ReceiveAndIngestNotifiers {
+	pub fn notify_receiver(&self) {
+		self.receiver.notify_one();
+	}
+
+	async fn wait_notification_to_receive(&self) {
+		self.receiver.notified().await;
+	}
+
+	fn notify_ingester(&self) {
+		self.ingester.notify_one();
+	}
+
+	async fn wait_notification_to_ingest(&self) {
+		self.ingester.notified().await;
+	}
+}
+
 pub async fn declare_actors(
 	data_dir: Box<Path>,
 	cloud_services: Arc<CloudServices>,
@@ -61,26 +85,24 @@ pub async fn declare_actors(
 	sync_group_pub_id: groups::PubId,
 	sync: SyncManager,
 	rng: CryptoRng,
-) -> Result<(), Error> {
-	let ingest_notify = Arc::new(Notify::new());
-
+) -> Result<Arc<ReceiveAndIngestNotifiers>, Error> {
 	let (sender, receiver) = (
 		Sender::new(
 			sync_group_pub_id,
 			sync.clone(),
 			Arc::clone(&cloud_services),
 			Arc::clone(&actors_state.send_active),
-			Arc::clone(&actors_state.notifier),
+			Arc::clone(&actors_state.state_change_notifier),
 			rng,
 		),
 		Receiver::new(
 			data_dir,
 			sync_group_pub_id,
-			cloud_services,
+			cloud_services.clone(),
 			sync.clone(),
-			Arc::clone(&ingest_notify),
+			Arc::clone(&actors_state.receiver_and_ingester_notifiers),
 			Arc::clone(&actors_state.receive_active),
-			Arc::clone(&actors_state.notifier),
+			Arc::clone(&actors_state.state_change_notifier),
 		),
 	)
 		.try_join()
@@ -88,9 +110,9 @@ pub async fn declare_actors(
 
 	let ingester = Ingester::new(
 		sync,
-		ingest_notify,
+		Arc::clone(&actors_state.receiver_and_ingester_notifiers),
 		Arc::clone(&actors_state.ingest_active),
-		Arc::clone(&actors_state.notifier),
+		Arc::clone(&actors_state.state_change_notifier),
 	);
 
 	actors
@@ -101,17 +123,14 @@ pub async fn declare_actors(
 		])
 		.await;
 
-	Ok(())
-}
+	cloud_services
+		.cloud_p2p()
+		.await?
+		.register_sync_messages_receiver_notifier(
+			sync_group_pub_id,
+			Arc::clone(&actors_state.receiver_and_ingester_notifiers),
+		)
+		.await;
 
-fn datetime_to_timestamp(latest_time: DateTime<Utc>) -> NTP64 {
-	NTP64::from(
-		SystemTime::from(latest_time)
-			.duration_since(UNIX_EPOCH)
-			.expect("hardcoded earlier time, nothing is earlier than UNIX_EPOCH"),
-	)
-}
-
-fn timestamp_to_datetime(timestamp: NTP64) -> DateTime<Utc> {
-	DateTime::from(timestamp.to_system_time())
+	Ok(Arc::clone(&actors_state.receiver_and_ingester_notifiers))
 }

@@ -59,7 +59,7 @@ pub fn mount() -> AlphaRouter<Ctx> {
 					)??;
 
 					if let Err(e) = key_manager
-						.add_key_with_hash(group_pub_id, new_key, key_hash, &mut rng)
+						.add_key_with_hash(group_pub_id, new_key, key_hash.clone(), &mut rng)
 						.await
 					{
 						super::handle_comm_error(
@@ -79,7 +79,7 @@ pub fn mount() -> AlphaRouter<Ctx> {
 
 					library.init_cloud_sync(&node, group_pub_id).await?;
 
-					debug!(%group_pub_id, "Created sync group");
+					debug!(%group_pub_id, ?key_hash, "Created sync group");
 
 					Ok(())
 				})
@@ -130,8 +130,14 @@ pub fn mount() -> AlphaRouter<Ctx> {
 						groups::get::ResponseKind::WithDevices(data) => {
 							CloudSyncGroupGetResponseKind::WithDevices(data)
 						}
+
 						groups::get::ResponseKind::FullData(data) => {
 							CloudSyncGroupGetResponseKind::FullData(data)
+						}
+						groups::get::ResponseKind::DevicesConnectionIds(_) => {
+							unreachable!(
+								"DevicesConnectionIds response is not expected, as we requested it"
+							);
 						}
 					}
 				}
@@ -142,6 +148,13 @@ pub fn mount() -> AlphaRouter<Ctx> {
 					use groups::get::{Request, Response};
 
 					let (client, access_token) = super::get_client_and_access_token(&node).await?;
+
+					if matches!(kind, groups::get::RequestKind::DevicesConnectionIds) {
+						return Err(rspc::Error::new(
+							rspc::ErrorCode::PreconditionFailed,
+							"This request isn't allowed here".into(),
+						));
+					}
 
 					let Response(response_kind) = super::handle_comm_error(
 						client

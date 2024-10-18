@@ -19,7 +19,7 @@ pub(crate) fn mount() -> AlphaRouter<Ctx> {
 						return Ok(());
 					}
 
-					sd_core_sync::backfill::backfill_operations(&library.db, &library.sync).await?;
+					sd_core_sync::backfill::backfill_operations(&library.sync).await?;
 
 					node.libraries
 						.edit(
@@ -68,7 +68,7 @@ pub(crate) fn mount() -> AlphaRouter<Ctx> {
 							};
 
 							tokio::select! {
-								_ = cloud_sync_state.notifier.notified() => {},
+								_ = cloud_sync_state.state_change_notifier.notified() => {},
 								_ = sync.active_notify.notified() => {}
 							}
 						}

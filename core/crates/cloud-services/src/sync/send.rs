@@ -5,6 +5,7 @@ use sd_core_sync::{CompressedCRDTOperationsPerModelPerDevice, SyncEvent, SyncMan
 use sd_actors::{Actor, Stopper};
 use sd_cloud_schema::{
 	devices,
+	error::{ClientSideError, NotFoundError},
 	sync::{self, groups, messages},
 	Client, Service,
 };
@@ -13,6 +14,7 @@ use sd_crypto::{
 	primitives::EncryptedBlock,
 	CryptoRng, SeedableRng,
 };
+use sd_utils::{datetime_to_timestamp, timestamp_to_datetime};
 
 use std::{
 	future::IntoFuture,
@@ -22,30 +24,38 @@ use std::{
 		atomic::{AtomicBool, Ordering},
 		Arc,
 	},
-	time::Duration,
+	time::{Duration, UNIX_EPOCH},
 };
 
 use async_stream::try_stream;
-use futures::{FutureExt, SinkExt, Stream, StreamExt, TryStream};
+use chrono::{DateTime, Utc};
+use futures::{FutureExt, SinkExt, Stream, StreamExt, TryStream, TryStreamExt};
 use futures_concurrency::future::{Race, TryJoin};
 use quic_rpc::{client::UpdateSink, pattern::bidi_streaming, transport::quinn::QuinnConnection};
 use reqwest_middleware::reqwest::{header, Body};
 use tokio::{
-	io, spawn,
+	spawn,
 	sync::{broadcast, oneshot, Notify, Semaphore},
 	time::sleep,
 };
 use tracing::{debug, error};
 use uuid::Uuid;
 
-use super::{datetime_to_timestamp, timestamp_to_datetime, SyncActors, ONE_MINUTE};
+use super::{SyncActors, ONE_MINUTE};
 
 const TEN_SECONDS: Duration = Duration::from_secs(10);
 const THIRTY_SECONDS: Duration = Duration::from_secs(30);
 
+const MESSAGES_COLLECTION_SIZE: u32 = 100_000;
+
 enum RaceNotifiedOrStopped {
 	Notified,
 	Stopped,
+}
+
+enum LoopStatus {
+	SentMessages,
+	Idle,
 }
 
 type LatestTimestamp = NTP64;
@@ -87,10 +97,24 @@ impl Actor<SyncActors> for Sender {
 
 			self.is_active.store(false, Ordering::Relaxed);
 
-			if let Err(e) = res {
-				error!(?e, "Error during cloud sync sender actor iteration");
-				sleep(ONE_MINUTE).await;
-				continue;
+			match res {
+				Ok(LoopStatus::SentMessages) => {
+					if let Ok(cloud_p2p) = self.cloud_services.cloud_p2p().await.map_err(|e| {
+						error!(?e, "Failed to get cloud p2p client on sender actor");
+					}) {
+						cloud_p2p
+							.notify_new_sync_messages(self.sync_group_pub_id)
+							.await;
+					}
+				}
+
+				Ok(LoopStatus::Idle) => {}
+
+				Err(e) => {
+					error!(?e, "Error during cloud sync sender actor iteration");
+					sleep(ONE_MINUTE).await;
+					continue;
+				}
 			}
 
 			self.state_notify.notify_waiters();
@@ -139,7 +163,7 @@ impl Sender {
 		})
 	}
 
-	async fn run_loop_iteration(&mut self) -> Result<(), Error> {
+	async fn run_loop_iteration(&mut self) -> Result<LoopStatus, Error> {
 		let current_device_pub_id = devices::PubId(Uuid::from(&self.sync.device_pub_id));
 
 		let (key_hash, secret_key) = self
@@ -152,9 +176,11 @@ impl Sender {
 
 		let mut crdt_ops_stream = pin!(self.sync.stream_device_ops(
 			&self.sync.device_pub_id,
-			1000,
+			MESSAGES_COLLECTION_SIZE,
 			current_latest_timestamp
 		));
+
+		let mut status = LoopStatus::Idle;
 
 		let mut new_latest_timestamp = current_latest_timestamp;
 		while let Some(ops_res) = crdt_ops_stream.next().await {
@@ -176,8 +202,17 @@ impl Sender {
 			let (_device_pub_id, compressed_ops) =
 				CompressedCRDTOperationsPerModelPerDevice::new_single_device(ops);
 
-			let messages_bytes = postcard::to_stdvec(&compressed_ops)
+			let messages_bytes = rmp_serde::to_vec_named(&compressed_ops)
 				.map_err(Error::SerializationFailureToPushSyncMessages)?;
+
+			let plain_text_size = messages_bytes.len();
+			let expected_blob_size = if plain_text_size <= EncryptedBlock::PLAIN_TEXT_SIZE {
+				OneShotEncryption::cipher_text_size(&secret_key, plain_text_size)
+			} else {
+				StreamEncryption::cipher_text_size(&secret_key, plain_text_size)
+			} as u64;
+
+			debug!(?expected_blob_size, ?key_hash, "Preparing sync message");
 
 			let (mut push_updates, mut push_responses) = self
 				.cloud_client
@@ -195,7 +230,7 @@ impl Sender {
 					operations_count,
 					start_time,
 					end_time,
-					expected_blob_size: messages_bytes.len() as u64,
+					expected_blob_size,
 				})
 				.await?;
 
@@ -241,11 +276,13 @@ impl Sender {
 			}
 
 			finalize_protocol(&mut push_updates, &mut push_responses).await?;
+
+			status = LoopStatus::SentMessages;
 		}
 
 		self.maybe_latest_timestamp = Some(new_latest_timestamp);
 
-		Ok(())
+		Ok(status)
 	}
 
 	async fn get_latest_timestamp(
@@ -255,10 +292,7 @@ impl Sender {
 		if let Some(latest_timestamp) = &self.maybe_latest_timestamp {
 			Ok(*latest_timestamp)
 		} else {
-			let messages::get_latest_time::Response {
-				latest_time,
-				latest_device_pub_id,
-			} = self
+			let latest_time = match self
 				.cloud_client
 				.sync()
 				.messages()
@@ -272,9 +306,22 @@ impl Sender {
 					current_device_pub_id,
 					kind: messages::get_latest_time::Kind::ForCurrentDevice,
 				})
-				.await??;
+				.await?
+			{
+				Ok(messages::get_latest_time::Response {
+					latest_time,
+					latest_device_pub_id,
+				}) => {
+					assert_eq!(latest_device_pub_id, current_device_pub_id);
+					latest_time
+				}
 
-			assert_eq!(latest_device_pub_id, current_device_pub_id);
+				Err(sd_cloud_schema::Error::Client(ClientSideError::NotFound(
+					NotFoundError::LatestSyncMessageTime,
+				))) => DateTime::<Utc>::from(UNIX_EPOCH),
+
+				Err(e) => return Err(e.into()),
+			};
 
 			Ok(datetime_to_timestamp(latest_time))
 		}
@@ -534,27 +581,37 @@ async fn upload_to_single_url(
 	messages_bytes: Vec<u8>,
 	rng: &mut CryptoRng,
 ) -> Result<(), Error> {
-	let (cipher_text_size, body) = if messages_bytes.len() > EncryptedBlock::PLAIN_TEXT_SIZE {
+	let (cipher_text_size, body) = if messages_bytes.len() <= EncryptedBlock::PLAIN_TEXT_SIZE {
 		let EncryptedBlock { nonce, cipher_text } =
 			OneShotEncryption::encrypt(&secret_key, messages_bytes.as_slice(), rng)
 				.map_err(Error::Encrypt)?;
 
-		(
-			nonce.len() + cipher_text.len(),
-			Body::wrap_stream(futures::stream::iter([
-				Ok::<_, io::Error>(nonce.to_vec()),
-				Ok(cipher_text),
-			])),
-		)
+		let cipher_text_size = nonce.len() + cipher_text.len();
+
+		let mut body_bytes = Vec::with_capacity(cipher_text_size);
+		body_bytes.extend_from_slice(nonce.as_slice());
+		body_bytes.extend(&cipher_text);
+
+		(cipher_text_size, Body::from(body_bytes))
 	} else {
 		let mut rng = CryptoRng::from_seed(rng.generate_fixed());
-		(
-			StreamEncryption::cipher_text_size(&secret_key, messages_bytes.len()),
-			Body::wrap_stream(stream_encryption(secret_key, messages_bytes, &mut rng)),
-		)
+		let cipher_text_size =
+			StreamEncryption::cipher_text_size(&secret_key, messages_bytes.len());
+
+		let body_bytes = stream_encryption(secret_key, messages_bytes, &mut rng)
+			.try_fold(
+				Vec::with_capacity(cipher_text_size),
+				|mut body_bytes, ciphered_chunk| async move {
+					body_bytes.extend(ciphered_chunk);
+					Ok(body_bytes)
+				},
+			)
+			.await?;
+
+		(cipher_text_size, Body::from(body_bytes))
 	};
 
-	let response = http_client
+	http_client
 		.put(url)
 		.header(header::CONTENT_LENGTH, cipher_text_size)
 		.body(body)
@@ -563,8 +620,6 @@ async fn upload_to_single_url(
 		.map_err(Error::UploadSyncMessages)?
 		.error_for_status()
 		.map_err(Error::ErrorResponseUploadSyncMessages)?;
-
-	debug!(?response, "Uploaded sync messages");
 
 	Ok(())
 }
