@@ -1,4 +1,4 @@
-import { Key, useEffect } from 'react';
+import { keepPreviousData } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { HardwareModel, useBridgeQuery, useLibraryQuery } from '@sd/client';
 import { useAccessToken, useLocale, useOperatingSystem } from '~/hooks';
@@ -30,7 +30,9 @@ export const Component = () => {
 	const { t } = useLocale();
 	const accessToken = useAccessToken();
 
-	const locationsQuery = useLibraryQuery(['locations.list'], { keepPreviousData: true });
+	const locationsQuery = useLibraryQuery(['locations.list'], {
+		placeholderData: keepPreviousData
+	});
 	const locations = locationsQuery.data ?? [];
 
 	// not sure if we'll need the node state in the future, as it should be returned with the cloud.devices.list query
