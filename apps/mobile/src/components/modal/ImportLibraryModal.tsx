@@ -2,7 +2,13 @@ import { BottomSheetFlatList } from '@gorhom/bottom-sheet';
 import { NavigationProp, useNavigation } from '@react-navigation/native';
 import { forwardRef } from 'react';
 import { ActivityIndicator, Text, View } from 'react-native';
-import { useBridgeMutation, useBridgeQuery, useClientContext, useRspcContext } from '@sd/client';
+import {
+	CloudLibrary,
+	useBridgeMutation,
+	useBridgeQuery,
+	useClientContext,
+	useRspcContext
+} from '@sd/client';
 import { Modal, ModalRef } from '~/components/layout/Modal';
 import { Button } from '~/components/primitive/Button';
 import useForwardedRef from '~/hooks/useForwardedRef';
@@ -93,7 +99,7 @@ const CloudLibraryCard = ({ modalRef, navigation }: Props) => {
 			<Button
 				size="sm"
 				variant="accent"
-				// disabled={joinLibrary.isLoading}
+				// disabled={joinLibrary.isPending}
 				onPress={async () => {
 					// const library = await joinLibrary.mutateAsync(data.uuid);
 
@@ -121,7 +127,7 @@ const CloudLibraryCard = ({ modalRef, navigation }: Props) => {
 				}}
 			>
 				<Text style={tw`text-sm font-medium text-white`}>
-					{/* {joinLibrary.isLoading && joinLibrary.variables === data.uuid
+					{/* {joinLibrary.isPending && joinLibrary.variables === data.uuid
 						? 'Joining...'
 						: 'Join'} */}
 					THIS FILE NEEDS TO BE UPDATED TO USE THE NEW LIBRARY SYSTEM IN THE FUTURE
